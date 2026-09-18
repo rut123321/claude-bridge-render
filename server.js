@@ -2,7 +2,6 @@ const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 
-const HOST = process.env.HOST || '0.0.0.0';
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const UPSTREAM_HOST = process.env.UPSTREAM_HOST || 'api.justwoker.icu';
 const UPSTREAM_KEY = process.env.UPSTREAM_KEY || 'sk-IEr4A0KR0RqyeNy5xBpCba6GWciti5ModqF7iTcJdX8upXAw';
@@ -154,6 +153,15 @@ function anthropicMessagesToOpenAI(messages, system) {
   return out;
 }
 
+function mapThinkingToEffort(thinking) {
+  if (!thinking || typeof thinking !== 'object') return undefined;
+  if (thinking.type === 'disabled') return undefined;
+  if (thinking.effort) return thinking.effort;
+  if (thinking.type === 'adaptive') return 'high';
+  if (thinking.type === 'enabled') return 'high';
+  return undefined;
+}
+
 function convertAnthropicRequest(body) {
   const messages = anthropicMessagesToOpenAI(body.messages, body.system);
   const req = {
@@ -165,6 +173,9 @@ function convertAnthropicRequest(body) {
   if (body.temperature !== undefined) req.temperature = body.temperature;
   if (body.top_p !== undefined) req.top_p = body.top_p;
   if (body.stop_sequences && body.stop_sequences.length) req.stop = body.stop_sequences;
+
+  const effort = body.reasoning_effort || mapThinkingToEffort(body.thinking);
+  if (effort) req.reasoning_effort = effort;
 
   if (Array.isArray(body.tools) && body.tools.length) {
     req.tools = body.tools.map((t) => ({
@@ -194,6 +205,10 @@ function convertOpenAIResponse(openai, requestedModel) {
   const choice = openai.choices && openai.choices[0] ? openai.choices[0] : {};
   const message = choice.message || {};
   const content = [];
+  if (message.reasoning_content || (message.reasoning && message.reasoning.content)) {
+    const rc = message.reasoning_content || message.reasoning.content || '';
+    if (rc) content.push({ type: 'thinking', thinking: rc, signature: '' });
+  }
   if (message.content != null) content.push({ type: 'text', text: message.content });
   for (const tc of message.tool_calls || []) {
     let input = {};
@@ -250,6 +265,7 @@ function handleStream(upRes, res, requestedModel) {
   const msgId = 'msg_' + crypto.randomBytes(8).toString('hex');
   let started = false;
   let textBlockOpen = false;
+  let thinkingBlockIndex = -1;
   const toolStates = new Map();
   let nextBlockIndex = 0;
   let done = false;
@@ -257,6 +273,12 @@ function handleStream(upRes, res, requestedModel) {
   let stopReason = null;
 
   function emit(name, data) { if (!done) res.write(anthropicEvent(name, data)); }
+
+  function openThinkingBlock() {
+    if (thinkingBlockIndex >= 0) return;
+    thinkingBlockIndex = nextBlockIndex++;
+    emit('content_block_start', { type: 'content_block_start', index: thinkingBlockIndex, content_block: { type: 'thinking', thinking: '', signature: '' } });
+  }
 
   function openTextBlock() {
     if (textBlockOpen) return;
@@ -266,6 +288,10 @@ function handleStream(upRes, res, requestedModel) {
   }
 
   function closeAllBlocks() {
+    if (thinkingBlockIndex >= 0) {
+      emit('content_block_stop', { type: 'content_block_stop', index: thinkingBlockIndex });
+      thinkingBlockIndex = -1;
+    }
     if (textBlockOpen) {
       emit('content_block_stop', { type: 'content_block_stop', index: 0 });
       textBlockOpen = false;
@@ -315,6 +341,13 @@ function handleStream(upRes, res, requestedModel) {
       if (delta.content) {
         openTextBlock();
         emit('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: delta.content } });
+      }
+      const reasoningDelta =
+        (delta.reasoning_content != null ? delta.reasoning_content : '') ||
+        (delta.reasoning && delta.reasoning.content != null ? delta.reasoning.content : '');
+      if (reasoningDelta) {
+        openThinkingBlock();
+        emit('content_block_delta', { type: 'content_block_delta', index: thinkingBlockIndex, delta: { type: 'thinking_delta', thinking: reasoningDelta } });
       }
       if (Array.isArray(delta.tool_calls)) {
         for (const tc of delta.tool_calls) {
@@ -429,11 +462,6 @@ function handleModels(req, res) {
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
-  if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/healthz')) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok' }));
-    return;
-  }
   if (req.method === 'GET' && url.pathname === '/v1/models') {
     handleModels(req, res);
     return;
@@ -448,8 +476,8 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Not found: ${req.method} ${url.pathname}` } }));
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`claude-bridge listening on http://${HOST}:${PORT}`);
+server.listen(PORT, () => {
+  console.log(`claude-bridge listening on http://127.0.0.1:${PORT}`);
   console.log(`Anthropic -> ${UPSTREAM_HOST}${COMPLETIONS_PATH}`);
   console.log(`target model: ${TARGET_MODEL}`);
 });
