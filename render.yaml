@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: claude-bridge
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: UPSTREAM_HOST
+        value: api.justwoker.icu
+      - key: UPSTREAM_KEY
+        sync: false
+      - key: TARGET_MODEL
+        value: replay-aigateway/claude-opus-4.8
